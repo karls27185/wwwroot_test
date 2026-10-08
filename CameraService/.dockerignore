@@ -1,0 +1,5 @@
+# Не нужно внутри образа
+logs/
+web.config
+Dockerfile
+.dockerignore

@@ -1,0 +1,315 @@
+# Docker Compose для WMS.KM.WS + тестовое окружение
+#
+# Приложения (host):
+#   wmsadmin      — WMS.KM.WS.Admin (.NET 6, MSSQL)        http://localhost:8080
+#   wmscodes      — WMS.KM.WS.Codes (.NET 6, PostgreSQL)   http://localhost:8020
+#   rollmanager   — WMS.KM.WS.RollManager (.NET 7)         http://localhost:8036
+#   clientfactory — ClientFactoryWMS (.NET 7)              http://localhost:8060
+#   cameraservice — CognexWorkerService.Blazor (.NET 9)    http://localhost:8070
+#
+# Тестовые эмуляторы:
+#   mssql         — SQL Server 2022 (wmsapi, wmsapi_jobs)  localhost:1433
+#   mssql-init    — one-shot: создаёт БД wmsapi / wmsapi_jobs
+#   postgres      — PostgreSQL 16 (wmsCodes)               localhost:5432
+#   central-mock  — мок центрального сервера (CENTRAL_HOST) http://localhost:8015
+#
+# Запуск:
+#   1) cp .env.example .env  и при необходимости задайте пароли/строки подключения
+#   2) docker compose up -d --build
+#
+# ВАЖНО: приложения НЕ создают схему БД (UseAutoMigration=false).
+#        Схему wmsapi восстанавливают из дампа; wmsapi_jobs (Hangfire) и wmsCodes — сервисы сами.
+
+services:
+
+  # ======================================================================
+  # ТЕСТОВЫЕ ЭМУЛЯТОРЫ
+  # ======================================================================
+
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: wms-mssql
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:-P@ssw0rd}"
+      MSSQL_PID: "Developer"
+    ports:
+      - "${MSSQL_PORT:-1433}:1433"
+    volumes:
+      - mssql-data:/var/opt/mssql
+    networks:
+      - wms
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' -b -o /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  mssql-init:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: wms-mssql-init
+    depends_on:
+      mssql:
+        condition: service_healthy
+    environment:
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:-P@ssw0rd}"
+    volumes:
+      - ./docker/mssql/init.sql:/init.sql:ro
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        for i in $$(seq 1 60); do
+          if /opt/mssql-tools18/bin/sqlcmd -S mssql -U sa -P "$$MSSQL_SA_PASSWORD" -C -i /init.sql -b; then
+            echo "mssql-init: databases are ready";
+            exit 0;
+          fi;
+          echo "mssql-init: waiting for mssql ($$i)...";
+          sleep 5;
+        done;
+        echo "mssql-init: failed";
+        exit 1
+    restart: "no"
+    networks:
+      - wms
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: wms-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-wmsCodes}"
+      POSTGRES_USER: "${POSTGRES_USER:-postgres}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-P@ssw0rd}"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - wms
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-wmsCodes}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # --- Мок центрального сервера (CENTRAL_HOST, ERP) ---
+  central-mock:
+    build:
+      context: ./docker/mock-api
+      dockerfile: Dockerfile
+    image: wms-mock-api:1.0.0
+    container_name: wms-central-mock
+    restart: unless-stopped
+    ports:
+      - "${CENTRAL_PORT:-8015}:8015"
+    environment:
+      SERVICE_NAME: "central-mock"
+      PORT: "8015"
+    networks:
+      - wms
+
+  # --- Мок сервиса печати упаковки (PRINTPACK_HOST) ---
+  printpack-mock:
+    build:
+      context: ./docker/mock-api
+      dockerfile: Dockerfile
+    image: wms-mock-api:1.0.0
+    container_name: wms-printpack-mock
+    restart: unless-stopped
+    ports:
+      - "${PRINTPACK_PORT:-8040}:8040"
+    environment:
+      SERVICE_NAME: "printpack-mock"
+      PORT: "8040"
+    networks:
+      - wms
+
+  # --- Мок CRPT-прокси / ЧЗ True API (CRPT_PROXY_URL) ---
+  crpt-mock:
+    build:
+      context: ./docker/mock-api
+      dockerfile: Dockerfile
+    image: wms-mock-api:1.0.0
+    container_name: wms-crpt-mock
+    restart: unless-stopped
+    ports:
+      - "${CRPT_PORT:-5050}:5050"
+    environment:
+      SERVICE_NAME: "crpt-mock"
+      PORT: "5050"
+    networks:
+      - wms
+
+  # ======================================================================
+  # ПРИЛОЖЕНИЯ
+  # ======================================================================
+
+  wmsadmin:
+    build:
+      context: ./WmsAdmin
+      dockerfile: Dockerfile
+    image: wmsadmin:2.6.30.129
+    container_name: wmsadmin
+    restart: unless-stopped
+    ports:
+      - "${WMSADMIN_HTTP_PORT:-8080}:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+      ASPNETCORE_URLS: "http://+:8080"
+      Logging__LogLevel__Default: "Information"
+      Logging__LogLevel__Microsoft: "Warning"
+      Logging__LogLevel__Microsoft.Hosting.Lifetime: "Information"
+      Logging__LogLevel__Hangfire: "Information"
+      # БД: wmsapi (данные) и wmsapi_jobs (Hangfire)
+      ConnectionStrings__DefaultConnection: "${DB_DEFAULT_CONNECTION:-Server=mssql,1433;Database=wmsapi;User Id=sa;Password=P@ssw0rd;TrustServerCertificate=True;Encrypt=False;}"
+      ConnectionStrings__HangfireConnection: "${DB_HANGFIRE_CONNECTION:-Server=mssql,1433;Database=wmsapi_jobs;User Id=sa;Password=P@ssw0rd;TrustServerCertificate=True;Encrypt=False;}"
+      # DataMatrix/коды — внутренний сервис wmscodes
+      Integration__GetDataMatrixStatsUrl:    "http://wmscodes:8020/Api/GetDataMatrixStats"
+      Integration__DownloadDataMatrixUrl:    "http://wmscodes:8020/Api/DownloadDataMatrix"
+      Integration__GetDataMatrixForPrintUrl: "http://wmscodes:8020/Api/GetDataMatrixForPrint"
+      Integration__DeleteOldDataMatrixUrl:   "http://wmscodes:8020/Api/DeleteOldDataMatrix"
+      # Центральный сервер (ERP) — по умолчанию мок central-mock
+      Integration__GetNewAssembliesUrl: "http://${CENTRAL_HOST:-central-mock}:${CENTRAL_PORT:-8015}/api/ws/getassemblies"
+      Integration__ConfirmAssemblyUrl:  "http://${CENTRAL_HOST:-central-mock}:${CENTRAL_PORT:-8015}/api/ws/confirmassembly"
+      Integration__CompleteAssemblyUrl: "http://${CENTRAL_HOST:-central-mock}:${CENTRAL_PORT:-8015}/api/ws/completeassembly"
+      # Печать упаковки
+      Integration__PrintPackUrl: "http://${PRINTPACK_HOST:-printpack-mock}:${PRINTPACK_PORT:-8040}"
+      WorkstationId: "${WORKSTATION_ID:-48c38a26-91ac-11e5-9e96-002590710fa1}"
+    volumes:
+      - ./WmsAdmin/logs:/app/logs
+    networks:
+      - wms
+    depends_on:
+      mssql-init:
+        condition: service_completed_successfully
+      wmscodes:
+        condition: service_started
+
+  wmscodes:
+    build:
+      context: ./WmsCodes
+      dockerfile: Dockerfile
+    image: wmscodes:1.6.11.5
+    container_name: wmscodes
+    restart: unless-stopped
+    ports:
+      - "${WMSCODES_HTTP_PORT:-8020}:8020"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+      ASPNETCORE_URLS: "http://+:8020"
+      Logging__LogLevel__Default: "Information"
+      Logging__LogLevel__Microsoft: "Warning"
+      Logging__LogLevel__Microsoft.Hosting.Lifetime: "Information"
+      # WmsCodes работает с PostgreSQL
+      ConnectionStrings__DefaultConnection: "${DB_CODES_CONNECTION:-Host=postgres;Port=5432;Database=wmsCodes;Username=postgres;Password=P@ssw0rd}"
+      # Центральный сервер (ERP)
+      Integration__GetDataMatrixUrl: "http://${CENTRAL_HOST:-central-mock}:${CENTRAL_PORT:-8015}/api/ws/getdatamatrix"
+      WorkstationId: "${WORKSTATION_ID:-48c38a26-91ac-11e5-9e96-002590710fa1}"
+    volumes:
+      - ./WmsCodes/logs:/app/logs
+    networks:
+      - wms
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  rollmanager:
+    build:
+      context: ./RollManager
+      dockerfile: Dockerfile
+    image: rollmanager:1.7.6.9
+    container_name: rollmanager
+    restart: unless-stopped
+    ports:
+      - "${ROLLMANAGER_HTTP_PORT:-8036}:8036"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+      ASPNETCORE_URLS: "http://+:8036"
+      Logging__LogLevel__Default: "Information"
+      Logging__LogLevel__Microsoft.AspNetCore: "Warning"
+      WMSServerApi__Url: "http://wmsadmin:8080"
+      CodesServerApi__Url: "http://wmscodes:8020/"
+      CentralServerApi__Url: "http://${CENTRAL_HOST:-central-mock}:${CENTRAL_PORT:-8015}/api/ws/"
+    volumes:
+      - ./RollManager/Logs:/app/Logs
+    networks:
+      - wms
+    depends_on:
+      - wmsadmin
+      - wmscodes
+
+  clientfactory:
+    build:
+      context: ./ClientFactory
+      dockerfile: Dockerfile
+    image: clientfactory:2.7.30.33
+    container_name: clientfactory
+    restart: unless-stopped
+    ports:
+      - "${CLIENTFACTORY_HTTP_PORT:-8060}:8060"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+      ASPNETCORE_URLS: "http://+:8060"
+      Logging__LogLevel__Default: "Information"
+      Logging__LogLevel__Microsoft.AspNetCore: "Warning"
+      WMSServerApi__Url: "http://wmsadmin:8080/"
+      SignalR__HubUrl: "http://wmsadmin:8080"
+      SignalR__CameraHubUrl: "http://cameraservice:8070"
+      CrptProxiApiUrl: "${CRPT_PROXY_URL:-http://crpt-mock:5050/}"
+      RefreshInterval__Camera: "1000"
+      RefreshInterval__CoordinatesCamera: "1000"
+      CameraResolution__Width: "3072"
+      CameraResolution__Height: "2048"
+    volumes:
+      - ./ClientFactory/Logs:/app/Logs
+    networks:
+      - wms
+    depends_on:
+      - wmsadmin
+      - cameraservice
+
+  cameraservice:
+    build:
+      context: ./CameraService
+      dockerfile: Dockerfile
+    image: cameraservice:2.9.6.5
+    container_name: cameraservice
+    restart: unless-stopped
+    ports:
+      - "${CAMERASERVICE_HTTP_PORT:-8070}:8070"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      ASPNETCORE_ENVIRONMENT: "Production"
+      ASPNETCORE_URLS: "http://+:8070"
+      Logging__LogLevel__Default: "Information"
+      Logging__LogLevel__Microsoft.AspNetCore: "Warning"
+      # Центральный сервер (ERP)
+      Integration__GetSessionsUrl: "http://${CENTRAL_HOST:-central-mock}:${CENTRAL_PORT:-8015}/GetCameraSessions"
+      Integration__SendCodesUrl:   "http://${CENTRAL_HOST:-central-mock}:${CENTRAL_PORT:-8015}/api/Product/AddProducts"
+      Integration__UserId:    "${CAMERA_USER_ID:-20B78C82-CA8F-4D54-A6D1-DBD1EEB5812C}"
+      Integration__UserToken: "${CAMERA_USER_TOKEN:-pet-1}"
+      HikrobotSettings__TcpSendPort: "${HIKROBOT_TCP_PORT:-4001}"
+    volumes:
+      - ./CameraService/logs:/app/logs
+    networks:
+      - wms
+
+networks:
+  wms:
+    driver: bridge
+
+volumes:
+  mssql-data:
+  postgres-data:
